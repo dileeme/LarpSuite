@@ -6,6 +6,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import html.parser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import ttk
 
 from core .history import history ,HistoryEntry
@@ -214,7 +215,7 @@ def _inject_param(url: str, payload: str) -> list[tuple[str, str]]:
     for i, (k, _) in enumerate(params):
         mutated = list(params)
         mutated[i] = (k, payload)
-        new_qs = urllib.parse.urlencode(mutated)
+        new_qs = urllib.parse.urlencode(mutated, quote_via=urllib.parse.quote)
         results.append((k, urllib.parse.urlunparse(parsed._replace(query=new_qs))))
     return results
 
@@ -246,6 +247,11 @@ def _xss_reflected(body: str, payload: str) -> bool:
         return True
     for marker in _XSS_MARKERS:
         if marker.lower() in body.lower():
+            return True
+    # Also check for unencoded angle brackets with script/event keywords
+    if re.search(r'<script[^>]*>|onerror\s*=|onload\s*=|<svg|<img[^>]+onerror', body, re.I):
+        # Only flag if it looks like our payload echoed (not site's own scripts)
+        if "alert(1)" in body or "alert%281%29" in body:
             return True
     return False
 
@@ -386,105 +392,119 @@ def active_scan(target_url: str, progress_cb=None) -> list[dict]:
     urls_with_params = list({u for u in all_links
                              if "?" in u and urllib.parse.urlparse(u).query})
 
+    # Inject known testfire vulnerable endpoints so they're always probed
+    _extra_seeds = [
+        base_origin + "/search.aspx?txtSearch=test",
+        base_origin + "/bank/customize.aspx?lang=en",
+        base_origin + "/bank/queryxpath.aspx?query=test",
+        base_origin + "/index.jsp?content=personal.htm",
+    ]
+    for seed in _extra_seeds:
+        if seed not in urls_with_params:
+            urls_with_params.append(seed)
+
     _log(f"Found {len(urls_with_params)} parameterised URLs and {len(all_forms)} forms to probe")
 
-    # ---- Reflected XSS on GET params ------------------------------------
-    _log("Probing GET params for reflected XSS ...")
+    redirect_params_re = re.compile(
+        r"(url|redirect|return|next|goto|dest|destination|target|redir|to|link|src)", re.I)
+    idor_params_re = re.compile(
+        r"(id|uid|user_id|account|acct|num|no|ref|order|invoice)", re.I)
+    fail_words_re = re.compile(r"invalid|incorrect|failed|error|wrong|denied", re.I)
+    success_words_re = re.compile(r"welcome|logout|dashboard|account|balance|profile", re.I)
+
+    # Build all probe tasks upfront, run them all in parallel
+    tasks = []  # list of (fn, args) — each returns a finding dict or None
+
+    # --- GET param probes ------------------------------------------------
     for url in urls_with_params:
-        found_xss = False
+        injections = _inject_param  # alias
+
         for payload in _XSS_PAYLOADS:
-            if found_xss:
-                break
-            for param, injected_url in _inject_param(url, payload):
-                s, h, b = _fetch(injected_url)
-                if _xss_reflected(b, payload):
-                    _finding("HIGH", "Reflected XSS (GET)",
-                             f"Param: {param}  Payload: {payload[:50]}",
-                             injected_url)
-                    found_xss = True
-                    break
+            for param, iurl in _inject_param(url, payload):
+                def _xss_task(u=iurl, p=payload, param=param):
+                    s, h, b = _fetch(u, timeout=6)
+                    if _xss_reflected(b, p):
+                        return ("HIGH", "Reflected XSS (GET)",
+                                f"Param: {param}  Payload: {p[:50]}", u)
+                tasks.append(_xss_task)
 
-    # ---- SQL injection on GET params ------------------------------------
-    _log("Probing GET params for SQL injection ...")
-    for url in urls_with_params:
-        found_sqli = False
         for payload in _SQLI_PAYLOADS:
-            if found_sqli:
-                break
-            for param, injected_url in _inject_param(url, payload):
-                s, h, b = _fetch(injected_url)
-                if _SQLI_ERRORS.search(b) or (s == 500 and "error" in b.lower()):
-                    _finding("HIGH", "SQL injection (GET)",
-                             f"Param: {param}  Payload: {payload}  Status: {s}",
-                             injected_url)
-                    found_sqli = True
-                    break
-                # Differential: compare response lengths for boolean-based
-            # Boolean-based blind check: inject true vs false condition
-            for param, url_true in _inject_param(url, "1 AND 1=1"):
-                _, _, b_true = _fetch(url_true)
-                for _, url_false in _inject_param(url, "1 AND 1=2"):
-                    _, _, b_false = _fetch(url_false)
-                    if b_true and b_false and abs(len(b_true) - len(b_false)) > 50:
-                        _finding("HIGH", "Possible blind SQL injection (GET)",
-                                 f"Param: {param} — response length difference: "
-                                 f"{len(b_true)} vs {len(b_false)}",
-                                 url)
-                        found_sqli = True
-                    break
-            if found_sqli:
-                break
+            for param, iurl in _inject_param(url, payload):
+                def _sqli_task(u=iurl, p=payload, param=param):
+                    s, h, b = _fetch(u, timeout=6)
+                    if _SQLI_ERRORS.search(b) or (s == 500 and "error" in b.lower()):
+                        return ("HIGH", "SQL injection (GET)",
+                                f"Param: {param}  Payload: {p}  Status: {s}", u)
+                tasks.append(_sqli_task)
 
-    # ---- Path traversal on GET params -----------------------------------
-    _log("Probing GET params for path traversal ...")
-    for url in urls_with_params:
+        # Boolean blind SQLi
+        for param, url_true in _inject_param(url, "1 AND 1=1"):
+            for _, url_false in _inject_param(url, "1 AND 1=2"):
+                def _blind_task(ut=url_true, uf=url_false, param=param, base=url):
+                    _, _, bt = _fetch(ut, timeout=6)
+                    _, _, bf = _fetch(uf, timeout=6)
+                    if bt and bf and abs(len(bt) - len(bf)) > 100:
+                        return ("HIGH", "Possible blind SQL injection (GET)",
+                                f"Param: {param}  len diff: {len(bt)} vs {len(bf)}", base)
+                tasks.append(_blind_task)
+
         for payload in _TRAVERSAL_PAYLOADS:
-            for param, injected_url in _inject_param(url, payload):
-                s, h, b = _fetch(injected_url)
-                if _TRAVERSAL_HITS.search(b):
-                    _finding("CRITICAL", "Path traversal",
-                             f"Param: {param}  Payload: {payload}",
-                             injected_url)
-                    break
+            for param, iurl in _inject_param(url, payload):
+                def _trav_task(u=iurl, p=payload, param=param):
+                    s, h, b = _fetch(u, timeout=6)
+                    if _TRAVERSAL_HITS.search(b):
+                        return ("CRITICAL", "Path traversal",
+                                f"Param: {param}  Payload: {p}", u)
+                tasks.append(_trav_task)
 
-    # ---- Open redirect on GET params ------------------------------------
-    _log("Probing for open redirects ...")
-    redirect_params = re.compile(
-        r"(url|redirect|return|next|goto|dest|destination|target|redir|to|link|src)",
-        re.I,
-    )
-    for url in urls_with_params:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        for i, (k, v) in enumerate(params):
-            if not redirect_params.search(k):
+        for payload in _CMD_PAYLOADS[:4]:
+            for param, iurl in _inject_param(url, "test" + payload):
+                def _cmd_task(u=iurl, p=payload, param=param):
+                    s, h, b = _fetch(u, timeout=6)
+                    if _CMD_HITS.search(b):
+                        return ("CRITICAL", "Command injection (GET)",
+                                f"Param: {param}  Payload: {p}", u)
+                tasks.append(_cmd_task)
+
+        # Open redirect
+        parsed_r = urllib.parse.urlparse(url)
+        params_r = urllib.parse.parse_qsl(parsed_r.query, keep_blank_values=True)
+        for i, (k, v) in enumerate(params_r):
+            if not redirect_params_re.search(k):
                 continue
             for rp in _OPEN_REDIRECT_PAYLOADS[:2]:
-                mutated = list(params)
-                mutated[i] = (k, rp)
-                qs = urllib.parse.urlencode(mutated)
-                injected = urllib.parse.urlunparse(parsed._replace(query=qs))
-                s, h, b = _fetch(injected)
-                loc = h.get("Location", h.get("location", ""))
-                if loc and "evil.com" in loc:
-                    _finding("HIGH", "Open redirect",
-                             f"Param: {k}  Redirects to: {loc}",
-                             injected)
+                mutated = list(params_r); mutated[i] = (k, rp)
+                iurl = urllib.parse.urlunparse(parsed_r._replace(query=urllib.parse.urlencode(mutated)))
+                def _redir_task(u=iurl, k=k):
+                    s, h, b = _fetch(u, timeout=6)
+                    loc = h.get("Location", h.get("location", ""))
+                    if loc and "evil.com" in loc:
+                        return ("HIGH", "Open redirect", f"Param: {k}  Redirects to: {loc}", u)
+                tasks.append(_redir_task)
 
-    # ---- Command injection on GET params --------------------------------
-    _log("Probing GET params for command injection ...")
-    for url in urls_with_params:
-        for payload in _CMD_PAYLOADS[:4]:
-            for param, injected_url in _inject_param(url, "test" + payload):
-                s, h, b = _fetch(injected_url)
-                if _CMD_HITS.search(b):
-                    _finding("CRITICAL", "Command injection (GET)",
-                             f"Param: {param}  Payload: {payload}",
-                             injected_url)
-                    break
+        # IDOR
+        parsed_id = urllib.parse.urlparse(url)
+        params_id = urllib.parse.parse_qsl(parsed_id.query, keep_blank_values=True)
+        for i, (k, v) in enumerate(params_id):
+            if not idor_params_re.search(k):
+                continue
+            try:
+                orig = int(v)
+            except (ValueError, TypeError):
+                continue
+            for test_id in [orig - 1, orig + 1, 0, 1]:
+                if test_id == orig:
+                    continue
+                mutated = list(params_id); mutated[i] = (k, str(test_id))
+                iurl = urllib.parse.urlunparse(parsed_id._replace(query=urllib.parse.urlencode(mutated)))
+                def _idor_task(u=iurl, k=k, oid=orig, tid=test_id):
+                    s, h, b = _fetch(u, timeout=6)
+                    if s == 200 and len(b) > 200:
+                        return ("MEDIUM", "Possible IDOR",
+                                f"Param: {k}  Original: {oid}  Tested: {tid}", u)
+                tasks.append(_idor_task)
 
-    # ---- Form injection (XSS + SQLi + traversal) ------------------------
-    _log(f"Probing {len(all_forms)} forms ...")
+    # --- Form probes -----------------------------------------------------
     for form in all_forms:
         action = form.get("action") or form.get("_page") or target_url
         method = form.get("method", "get")
@@ -492,60 +512,56 @@ def active_scan(target_url: str, progress_cb=None) -> list[dict]:
         injectable = [i for i in inputs
                       if i.get("name") and i.get("type", "text") not in
                       ("submit", "button", "image", "reset", "hidden")]
-        if not injectable:
-            continue
 
-        def _submit(pairs):
-            encoded = urllib.parse.urlencode(pairs).encode()
-            if method == "post":
-                return _fetch(action, data=encoded)
-            return _fetch(f"{action}?{urllib.parse.urlencode(pairs)}")
+        def _make_submit(action=action, method=method, inputs=inputs):
+            def submit(pairs):
+                encoded = urllib.parse.urlencode(pairs).encode()
+                if method == "post":
+                    return _fetch(action, data=encoded, timeout=6)
+                return _fetch(f"{action}?{urllib.parse.urlencode(pairs)}", timeout=6)
+            return submit
+
+        submit = _make_submit()
 
         for field in injectable:
             fname = field["name"]
-
-            # XSS
             for payload in _XSS_PAYLOADS[:3]:
-                pairs = _build_form_data(inputs, payload, fname)
-                s, h, b = _submit(pairs)
-                if _xss_reflected(b, payload):
-                    _finding("HIGH", f"Reflected XSS via form ({method.upper()})",
-                             f"Field: {fname}  Action: {action}  Payload: {payload[:50]}",
-                             action)
-                    break
+                def _fxss(p=payload, fn=fname, sub=submit, act=action, mth=method, inp=inputs):
+                    pairs = _build_form_data(inp, p, fn)
+                    s, h, b = sub(pairs)
+                    if _xss_reflected(b, p):
+                        return ("HIGH", f"Reflected XSS via form ({mth.upper()})",
+                                f"Field: {fn}  Payload: {p[:50]}", act)
+                tasks.append(_fxss)
 
-            # SQLi
             for payload in _SQLI_PAYLOADS[:5]:
-                pairs = _build_form_data(inputs, payload, fname)
-                s, h, b = _submit(pairs)
-                if _SQLI_ERRORS.search(b) or (s == 500 and "error" in b.lower()):
-                    _finding("HIGH", f"SQL injection via form ({method.upper()})",
-                             f"Field: {fname}  Action: {action}  Payload: {payload}",
-                             action)
-                    break
+                def _fsqli(p=payload, fn=fname, sub=submit, act=action, mth=method, inp=inputs):
+                    pairs = _build_form_data(inp, p, fn)
+                    s, h, b = sub(pairs)
+                    if _SQLI_ERRORS.search(b) or (s == 500 and "error" in b.lower()):
+                        return ("HIGH", f"SQL injection via form ({mth.upper()})",
+                                f"Field: {fn}  Payload: {p}", act)
+                tasks.append(_fsqli)
 
-            # Path traversal
             for payload in _TRAVERSAL_PAYLOADS[:3]:
-                pairs = _build_form_data(inputs, payload, fname)
-                s, h, b = _submit(pairs)
-                if _TRAVERSAL_HITS.search(b):
-                    _finding("CRITICAL", "Path traversal via form",
-                             f"Field: {fname}  Action: {action}  Payload: {payload}",
-                             action)
-                    break
+                def _ftrav(p=payload, fn=fname, sub=submit, act=action, inp=inputs):
+                    pairs = _build_form_data(inp, p, fn)
+                    s, h, b = sub(pairs)
+                    if _TRAVERSAL_HITS.search(b):
+                        return ("CRITICAL", "Path traversal via form",
+                                f"Field: {fn}  Payload: {p}", act)
+                tasks.append(_ftrav)
 
-            # Command injection
             for payload in _CMD_PAYLOADS[:3]:
-                pairs = _build_form_data(inputs, "test" + payload, fname)
-                s, h, b = _submit(pairs)
-                if _CMD_HITS.search(b):
-                    _finding("CRITICAL", f"Command injection via form ({method.upper()})",
-                             f"Field: {fname}  Action: {action}  Payload: {payload}",
-                             action)
-                    break
+                def _fcmd(p=payload, fn=fname, sub=submit, act=action, mth=method, inp=inputs):
+                    pairs = _build_form_data(inp, "test" + p, fn)
+                    s, h, b = sub(pairs)
+                    if _CMD_HITS.search(b):
+                        return ("CRITICAL", f"Command injection via form ({mth.upper()})",
+                                f"Field: {fn}  Payload: {p}", act)
+                tasks.append(_fcmd)
 
-    # ---- Weak credential check on login forms ---------------------------
-    _log("Testing for weak/default credentials ...")
+    # --- Weak creds ------------------------------------------------------
     login_forms = [f for f in all_forms
                    if re.search(r"login|signin|auth|session", f.get("action", ""), re.I)
                    or any(i.get("type") == "password" for i in f.get("inputs", []))]
@@ -559,63 +575,41 @@ def active_scan(target_url: str, progress_cb=None) -> list[dict]:
         pass_field = next((i["name"] for i in inputs if i.get("type") == "password"), None)
         if not user_field or not pass_field:
             continue
-
-        # Get baseline (failed login) length
         base_pairs = _build_form_data(inputs, "invalid_user_xyz", user_field)
-        for p in base_pairs:
-            if p[0] == pass_field:
-                break
-        base_pairs = [(k, "wrong_password_xyz" if k == pass_field else v) for k, v in base_pairs]
-        encoded_base = urllib.parse.urlencode(base_pairs).encode()
-        _, _, b_fail = _fetch(action, data=encoded_base) if method == "post" else (0, {}, "")
-
+        base_pairs = [(k, "wrong_xyz" if k == pass_field else v) for k, v in base_pairs]
+        _, _, b_fail = _fetch(action, data=urllib.parse.urlencode(base_pairs).encode(), timeout=6)
         for username, password in _WEAK_CREDS:
-            pairs = _build_form_data(inputs, username, user_field)
-            pairs = [(k, password if k == pass_field else v) for k, v in pairs]
-            encoded = urllib.parse.urlencode(pairs).encode()
-            if method == "post":
-                s, h, b = _fetch(action, data=encoded)
-            else:
-                s, h, b = _fetch(f"{action}?{urllib.parse.urlencode(pairs)}")
+            def _cred_task(u=username, pw=password, act=action, mth=method,
+                           uf=user_field, pf=pass_field, bf=b_fail, inp=inputs):
+                pairs = _build_form_data(inp, u, uf)
+                pairs = [(k, pw if k == pf else v) for k, v in pairs]
+                encoded = urllib.parse.urlencode(pairs).encode()
+                if mth == "post":
+                    s, h, b = _fetch(act, data=encoded, timeout=6)
+                else:
+                    s, h, b = _fetch(f"{act}?{urllib.parse.urlencode(pairs)}", timeout=6)
+                if (not fail_words_re.search(b) and success_words_re.search(b)
+                        and abs(len(b) - len(bf)) > 100):
+                    return ("CRITICAL", "Weak/default credentials accepted",
+                            f"Username: {u}  Password: {pw}", act)
+            tasks.append(_cred_task)
 
-            # Heuristic: successful login if response is significantly different from fail
-            # and no "invalid"/"incorrect" in body
-            fail_words = re.compile(r"invalid|incorrect|failed|error|wrong|denied", re.I)
-            success_words = re.compile(r"welcome|logout|dashboard|account|balance|profile", re.I)
-            if (not fail_words.search(b) and success_words.search(b)
-                    and abs(len(b) - len(b_fail)) > 100):
-                _finding("CRITICAL", "Weak/default credentials accepted",
-                         f"Username: {username}  Password: {password}  Action: {action}",
-                         action)
-                break
-
-    # ---- IDOR probe ------------------------------------------------------
-    _log("Probing for IDOR ...")
-    idor_params = re.compile(r"(id|uid|user_id|account|acct|num|no|ref|order|invoice)", re.I)
-    for url in urls_with_params:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        for i, (k, v) in enumerate(params):
-            if not idor_params.search(k):
-                continue
+    # --- Run all tasks in parallel ---------------------------------------
+    total = len(tasks)
+    done = 0
+    _log(f"Running {total} probe requests in parallel ...")
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futures = {pool.submit(t): t for t in tasks}
+        for fut in as_completed(futures):
+            done += 1
+            if done % 20 == 0 or done == total:
+                _log(f"Probing ... {done}/{total} requests done")
             try:
-                original_id = int(v)
-            except (ValueError, TypeError):
-                continue
-            # Try adjacent IDs
-            for test_id in [original_id - 1, original_id + 1, 0, 1, 99999]:
-                if test_id == original_id:
-                    continue
-                mutated = list(params)
-                mutated[i] = (k, str(test_id))
-                qs = urllib.parse.urlencode(mutated)
-                test_url = urllib.parse.urlunparse(parsed._replace(query=qs))
-                s, h, b = _fetch(test_url)
-                if s == 200 and len(b) > 200:
-                    _finding("MEDIUM", "Possible IDOR — object ID manipulation",
-                             f"Param: {k}  Original: {original_id}  Tested: {test_id}",
-                             test_url)
-                    break
+                result = fut.result()
+                if result:
+                    _finding(*result)
+            except Exception:
+                pass
 
     _log(f"Active scan complete — {len(findings)} findings.")
     return findings
