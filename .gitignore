@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+ca/*.crt
+ca/*.key
+proxy_debug.log
+larp_suite_ca.crt
+larp_suite_ca.key
