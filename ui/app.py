@@ -7,11 +7,12 @@ from tkinter import ttk, messagebox
 
 from core.ca import ca_cert_path, install_ca_windows, uninstall_ca_windows, generate_root_ca
 from core.proxy import ProxyServer
-from ui.proxy_tab    import ProxyTab
-from ui.repeater_tab import RepeaterTab
-from ui.intruder_tab import IntruderTab
-from ui.decoder_tab  import DecoderTab
-from ui.scanner_tab  import ScannerTab
+from ui.proxy_tab       import ProxyTab
+from ui.repeater_tab    import RepeaterTab
+from ui.intruder_tab    import IntruderTab
+from ui.decoder_tab     import DecoderTab
+from ui.scanner_tab     import ScannerTab
+from ui.diagnostics_tab import DiagnosticsTab
 
 
 DARK_BG   = "#2b2b2b"
@@ -114,15 +115,17 @@ class BurpLiteApp:
             proxy_server=self._proxy,
             send_to_repeater_cb=self._repeater_tab.load_entry,
         )
-        self._intruder_tab = IntruderTab(self._nb)
-        self._decoder_tab  = DecoderTab(self._nb)
-        self._scanner_tab  = ScannerTab(self._nb)
+        self._intruder_tab     = IntruderTab(self._nb)
+        self._decoder_tab      = DecoderTab(self._nb)
+        self._scanner_tab      = ScannerTab(self._nb)
+        self._diagnostics_tab  = DiagnosticsTab(self._nb)
 
-        self._nb.add(self._proxy_tab,    text="  Proxy  ")
-        self._nb.add(self._repeater_tab, text="  Repeater  ")
-        self._nb.add(self._intruder_tab, text="  Intruder  ")
-        self._nb.add(self._decoder_tab,  text="  Decoder  ")
-        self._nb.add(self._scanner_tab,  text="  Scanner  ")
+        self._nb.add(self._proxy_tab,       text="  Proxy  ")
+        self._nb.add(self._repeater_tab,    text="  Repeater  ")
+        self._nb.add(self._intruder_tab,    text="  Intruder  ")
+        self._nb.add(self._decoder_tab,     text="  Decoder  ")
+        self._nb.add(self._scanner_tab,     text="  Scanner  ")
+        self._nb.add(self._diagnostics_tab, text="  Code Diagnostics  ")
 
     # ── Proxy menu actions ───────────────────────────────────────────────────
 
